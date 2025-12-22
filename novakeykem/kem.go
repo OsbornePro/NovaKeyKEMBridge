@@ -1,162 +1,186 @@
 package novakeykem
 
 import (
-	"bytes"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/mlkem"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"io"
 	"time"
 
-	"filippo.io/mlkem768"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/hkdf"
 )
 
-// BuildV3InjectFrame returns the FULL TCP frame:
-//   [u16 length big-endian][payload bytes]
-//
-// It implements NovaKey Protocol v3 exactly:
-// - ML-KEM-768 encapsulation to server pubkey
-// - HKDF-SHA256 with deviceKey (32B hex) as salt
-// - XChaCha20-Poly1305 with AAD = header through kemCt
-// - Plaintext = [u64 timestamp BE][inner frame v1]
-//
-// outerMsgType is fixed to 1.
-// innerMsgType: 1=inject, 2=approve.
-//
-// serverPubB64: base64 server ML-KEM-768 public key
-// deviceKeyHex: 32-byte hex string (64 hex chars)
-func BuildV3InjectFrame(serverPubB64 string, deviceID string, deviceKeyHex string, secret string) ([]byte, error) {
-	return buildV3Frame(serverPubB64, deviceID, deviceKeyHex, 1, []byte(secret))
+type pairingBlob struct {
+	V                 int    `json:"v"`
+	DeviceID          string `json:"device_id"`
+	DeviceKeyHex      string `json:"device_key_hex"`
+	ServerAddr        string `json:"server_addr"`
+	ServerKyberPubB64 string `json:"server_kyber768_pub"`
 }
 
-func BuildV3ApproveFrame(serverPubB64 string, deviceID string, deviceKeyHex string) ([]byte, error) {
-	return buildV3Frame(serverPubB64, deviceID, deviceKeyHex, 2, nil)
+const (
+	outerVersion  = 3
+	outerMsgType  = 1
+	innerVersion  = 1
+	innerInject   = 1
+	innerApprove  = 2
+	hkdfInfo      = "NovaKey v3 AEAD key"
+)
+
+func BuildInjectFrame(pairingBlobJSON string, secret string) ([]byte, error) {
+	return buildFrame(pairingBlobJSON, innerInject, secret)
 }
 
-func buildV3Frame(serverPubB64 string, deviceID string, deviceKeyHex string, innerMsgType byte, payloadUTF8 []byte) ([]byte, error) {
-	if len(deviceID) == 0 || len(deviceID) > 255 {
-		return nil, errors.New("deviceID must be 1..255 bytes")
+func BuildApproveFrame(pairingBlobJSON string) ([]byte, error) {
+	return buildFrame(pairingBlobJSON, innerApprove, "")
+}
+
+func buildFrame(pairingBlobJSON string, innerType byte, payload string) ([]byte, error) {
+	var pb pairingBlob
+	if err := json.Unmarshal([]byte(pairingBlobJSON), &pb); err != nil {
+		return nil, err
 	}
-	if innerMsgType != 1 && innerMsgType != 2 {
-		return nil, errors.New("innerMsgType must be 1 (inject) or 2 (approve)")
+	if pb.DeviceID == "" || pb.DeviceKeyHex == "" || pb.ServerKyberPubB64 == "" {
+		return nil, errors.New("pairing blob missing required fields")
+	}
+	if innerType != innerInject && innerType != innerApprove {
+		return nil, errors.New("invalid inner type")
 	}
 
-	// device PSK salt: 32 bytes
-	deviceKey, err := hex.DecodeString(deviceKeyHex)
+	deviceKey, err := hex.DecodeString(pb.DeviceKeyHex)
 	if err != nil {
-		return nil, errors.New("deviceKeyHex must be hex")
+		return nil, err
 	}
 	if len(deviceKey) != 32 {
-		return nil, errors.New("deviceKeyHex must decode to 32 bytes")
+		return nil, errors.New("device_key_hex must decode to 32 bytes")
 	}
 
-	// server pubkey bytes
-	serverPub, err := base64.StdEncoding.DecodeString(serverPubB64)
-	if err != nil {
-		return nil, errors.New("serverPubB64 must be base64")
-	}
-	if len(serverPub) != mlkem768.EncapsulationKeySize {
-		return nil, errors.New("server pubkey wrong length for ML-KEM-768")
-	}
-
-	// KEM
-	kemCt, kemShared, err := mlkem768.Encapsulate(serverPub)
+	serverPubBytes, err := base64.StdEncoding.DecodeString(pb.ServerKyberPubB64)
 	if err != nil {
 		return nil, err
 	}
 
-	// HKDF -> 32-byte AEAD key
-	key := make([]byte, 32)
-	h := hkdf.New(sha256.New, kemShared, deviceKey, []byte("NovaKey v3 AEAD key"))
-	if _, err := h.Read(key); err != nil {
+	ek, err := mlkem.NewEncapsulationKey768(serverPubBytes)
+	if err != nil {
 		return nil, err
 	}
 
-	// Outer header (v3)
-	// [0]=version(3) [1]=outerMsgType(1) [2]=idLen [3:]=deviceID
-	// then [kemCtLen u16][kemCt bytes]
-	var header bytes.Buffer
-	header.WriteByte(3) // version
-	header.WriteByte(1) // outer msgType fixed
-	header.WriteByte(byte(len(deviceID)))
-	header.WriteString(deviceID)
+	// ML-KEM encapsulate (sharedKey, ciphertext)
+	sharedKey, kemCt := ek.Encapsulate() // signature per stdlib crypto/mlkem :contentReference[oaicite:1]{index=1}
+	if len(sharedKey) != 32 {
+		return nil, errors.New("unexpected sharedKey length")
+	}
+	if len(kemCt) == 0 {
+		return nil, errors.New("empty KEM ciphertext")
+	}
 
-	kemCtLen := make([]byte, 2)
-	binary.BigEndian.PutUint16(kemCtLen, uint16(len(kemCt)))
-	header.Write(kemCtLen)
-	header.Write(kemCt)
+	// Inner typed frame
+	inner := buildInnerFrame(pb.DeviceID, innerType, []byte(payload))
 
-	aad := header.Bytes() // AAD = payload[0:K]
-
-	// Plaintext = [u64 timestamp BE][inner frame v1]
-	// inner frame:
-	// [0]=innerVersion(1)
-	// [1]=innerMsgType (1 inject, 2 approve)
-	// [2:4]=deviceIDLen u16 BE
-	// [4:8]=payloadLen u32 BE
-	// [..]=deviceID bytes
-	// [..]=payload bytes (UTF-8)
+	// Plaintext = timestamp(u64 big endian) || innerFrame
 	ts := uint64(time.Now().Unix())
-	plain := &bytes.Buffer{}
-	tsb := make([]byte, 8)
-	binary.BigEndian.PutUint64(tsb, ts)
-	plain.Write(tsb)
+	plain := make([]byte, 8+len(inner))
+	binary.BigEndian.PutUint64(plain[0:8], ts)
+	copy(plain[8:], inner)
 
-	inner := &bytes.Buffer{}
-	inner.WriteByte(1)           // innerVersion
-	inner.WriteByte(innerMsgType) // innerMsgType
-
-	idLenBE := make([]byte, 2)
-	binary.BigEndian.PutUint16(idLenBE, uint16(len(deviceID)))
-	inner.Write(idLenBE)
-
-	plLenBE := make([]byte, 4)
-	binary.BigEndian.PutUint32(plLenBE, uint32(len(payloadUTF8)))
-	inner.Write(plLenBE)
-
-	inner.WriteString(deviceID)
-	if len(payloadUTF8) > 0 {
-		inner.Write(payloadUTF8)
+	// HKDF-SHA256: IKM=sharedKey, salt=deviceKey, info="NovaKey v3 AEAD key"
+	key := make([]byte, 32)
+	h := hkdf.New(sha256.New, sharedKey, deviceKey, []byte(hkdfInfo))
+	if _, err := io.ReadFull(h, key); err != nil {
+		return nil, err
 	}
 
-	plain.Write(inner.Bytes())
-
-	// XChaCha20-Poly1305 (24-byte nonce)
-	aead, err := chacha20poly1305.NewX(key)
+	aead, err := chacha20poly1305.NewX(key) // XChaCha20-Poly1305 (24-byte nonce)
 	if err != nil {
 		return nil, err
 	}
 
-	nonce := make([]byte, chacha20poly1305.NonceSizeX) // 24
+	nonce := make([]byte, chacha20poly1305.NonceSizeX)
 	if _, err := rand.Read(nonce); err != nil {
 		return nil, err
 	}
 
-	ciphertext := aead.Seal(nil, nonce, plain.Bytes(), aad)
+	// Outer header (AAD covers header through kemCt)
+	header, err := buildOuterHeader(pb.DeviceID, kemCt)
+	if err != nil {
+		return nil, err
+	}
+	aad := header
 
-	// Final v3 payload bytes:
-	// header || nonce || ciphertext
-	payload := &bytes.Buffer{}
-	payload.Write(aad)
-	payload.Write(nonce)
-	payload.Write(ciphertext)
+	ciphertext := aead.Seal(nil, nonce, plain, aad)
 
-	// TCP frame: [u16 length][payload]
-	p := payload.Bytes()
-	if len(p) > 65535 {
-		return nil, errors.New("payload too large")
+	// Outer payload = header || nonce || ciphertext
+	payloadBytes := make([]byte, 0, len(header)+len(nonce)+len(ciphertext))
+	payloadBytes = append(payloadBytes, header...)
+	payloadBytes = append(payloadBytes, nonce...)
+	payloadBytes = append(payloadBytes, ciphertext...)
+
+	if len(payloadBytes) > 0xFFFF {
+		return nil, errors.New("payload too large for u16 framing")
 	}
 
-	out := &bytes.Buffer{}
-	lenBE := make([]byte, 2)
-	binary.BigEndian.PutUint16(lenBE, uint16(len(p)))
-	out.Write(lenBE)
-	out.Write(p)
+	// TCP frame: [u16 length big-endian][payload]
+	out := make([]byte, 2+len(payloadBytes))
+	binary.BigEndian.PutUint16(out[0:2], uint16(len(payloadBytes)))
+	copy(out[2:], payloadBytes)
+	return out, nil
+}
 
-	return out.Bytes(), nil
+func buildOuterHeader(deviceID string, kemCt []byte) ([]byte, error) {
+	idb := []byte(deviceID)
+	if len(idb) == 0 || len(idb) > 255 {
+		return nil, errors.New("deviceID must be 1..255 bytes")
+	}
+	if len(kemCt) > 0xFFFF {
+		return nil, errors.New("kemCt too large")
+	}
+
+	// layout:
+	// [0]=version [1]=outerMsgType [2]=idLen [3..]=deviceID
+	// then [kemCtLen u16] [kemCt]
+	hlen := 3 + len(idb) + 2 + len(kemCt)
+	h := make([]byte, hlen)
+
+	h[0] = outerVersion
+	h[1] = outerMsgType
+	h[2] = byte(len(idb))
+	copy(h[3:3+len(idb)], idb)
+
+	pos := 3 + len(idb)
+	binary.BigEndian.PutUint16(h[pos:pos+2], uint16(len(kemCt)))
+	pos += 2
+	copy(h[pos:], kemCt)
+
+	return h, nil
+}
+
+func buildInnerFrame(deviceID string, msgType byte, payload []byte) []byte {
+	idb := []byte(deviceID)
+
+	// [0]=innerVersion [1]=innerMsgType [2:4]=deviceIDLen(u16) [4:8]=payloadLen(u32)
+	// then deviceID bytes, then payload bytes
+	out := make([]byte, 8+len(idb)+len(payload))
+	out[0] = innerVersion
+	out[1] = msgType
+	binary.BigEndian.PutUint16(out[2:4], uint16(len(idb)))
+	binary.BigEndian.PutUint32(out[4:8], uint32(len(payload)))
+	copy(out[8:8+len(idb)], idb)
+	copy(out[8+len(idb):], payload)
+	return out
+}
+
+// (Optional) tiny helper if you want a deterministic HMAC for “signature” style checks later.
+// Keep this private unless you really need it bound into Swift.
+func mac256(key, data []byte) []byte {
+	m := hmac.New(sha256.New, key)
+	m.Write(data)
+	return m.Sum(nil)
 }
 

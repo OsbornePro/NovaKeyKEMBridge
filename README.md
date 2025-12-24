@@ -2,7 +2,7 @@
 
 ## Overview
 
-**NovaKeyKEMBridge** is a Go module and bridging project designed to enable secure communication between the **NovaKey** iOS application and a companion daemon running on a desktop computer (typically macOS).
+**NovaKeyKEMBridge** is a Go module and bridging project designed to enable secure communication between the **NovaKey** iOS application and a companion daemon running on a desktop computer.
 
 The core functionality is provided by the `novakeykem` Go package, which implements a custom post-quantum secure protocol using **ML-KEM-768** (formerly known as Kyber-768, standardized in NIST FIPS 203). This allows the iOS app to securely "inject" secrets or send approval messages to the daemon over TCP, with forward-secure, quantum-resistant encryption.
 

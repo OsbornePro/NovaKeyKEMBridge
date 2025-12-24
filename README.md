@@ -71,8 +71,7 @@ Similar for `NovakeykemBuildApproveFrame(pairingJSON)`.
 This provides strong post-quantum confidentiality and authentication for short messages/secrets from iOS to the desktop daemon.
 
 ## License
-
-(Not specified in source – add your preferred license here if publishing.)
+Apache License, Version 2.0 – see `LICENSE.md`.
 
 ## Author
 

@@ -176,8 +176,8 @@ func buildInnerFrame(deviceID string, msgType byte, payload []byte) []byte {
 	return out
 }
 
-// (Optional) tiny helper if you want a deterministic HMAC for “signature” style checks later.
-// Keep this private unless you really need it bound into Swift.
+// (Optional) tiny helper if we want a deterministic HMAC for “signature” style checks later.
+// Keep private unless really need it bound into Swift.
 func mac256(key, data []byte) []byte {
 	m := hmac.New(sha256.New, key)
 	m.Write(data)

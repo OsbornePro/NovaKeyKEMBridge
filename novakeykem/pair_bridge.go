@@ -1,6 +1,7 @@
 package novakeykem
 
 import (
+	"crypto/mlkem"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -10,13 +11,16 @@ import (
 	"errors"
 	"io"
 
-	"filippo.io/mlkem768"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/hkdf"
 )
 
 // MUST MATCH YOUR DAEMON derivePairAEADKey info string
-const pairHKDFInfo = "NovaKey v4 Pair AEAD"
+// You said: there is no v4; only v3.
+const pairHKDFInfo = "NovaKey v3 Pair AEAD"
+
+// ML-KEM-768 ciphertext size (Kyber768 / ML-KEM-768)
+const kemCtSize768 = 1088
 
 type pairServerKey struct {
 	Op          string `json:"op"`
@@ -40,18 +44,17 @@ func BuildPairRegisterBundle(serverKeyJSON string, tokenRawURLB64 string, device
 	if deviceID == "" {
 		return nil, errors.New("deviceID empty")
 	}
-	// deviceKeyHex can be empty; daemon will generate if empty — but YOUR iOS code is generating it.
 	if deviceKeyHex == "" {
 		return nil, errors.New("deviceKeyHex empty")
-	}
-	if _, err := hex.DecodeString(deviceKeyHex); err != nil {
-		return nil, errors.New("deviceKeyHex not valid hex")
 	}
 	if len(deviceKeyHex) != 64 {
 		return nil, errors.New("deviceKeyHex must be 32 bytes (64 hex chars)")
 	}
+	if _, err := hex.DecodeString(deviceKeyHex); err != nil {
+		return nil, errors.New("deviceKeyHex not valid hex")
+	}
 
-	// Parse server key
+	// Parse server key JSON
 	var sk pairServerKey
 	if err := json.Unmarshal([]byte(serverKeyJSON), &sk); err != nil {
 		return nil, err
@@ -70,22 +73,25 @@ func BuildPairRegisterBundle(serverKeyJSON string, tokenRawURLB64 string, device
 		return nil, err
 	}
 
-	// mlkem768 encapsulate -> (ct, shared)
-	ek, err := mlkem768.NewEncapsulationKey(pubBytes)
+	// ML-KEM-768 encapsulate using stdlib crypto/mlkem
+	ek, err := mlkem.NewEncapsulationKey768(pubBytes)
 	if err != nil {
 		return nil, err
 	}
-	ct, shared := ek.Encapsulate()
-	if len(ct) != mlkem768.CiphertextSize {
-		return nil, errors.New("unexpected ct size")
+
+	// NOTE: stdlib order is (sharedKey, kemCt)
+	sharedKey, kemCt := ek.Encapsulate()
+
+	if len(sharedKey) != 32 {
+		return nil, errors.New("unexpected sharedKey length")
 	}
-	if len(shared) == 0 {
-		return nil, errors.New("empty shared secret")
+	if len(kemCt) != kemCtSize768 {
+		return nil, errors.New("unexpected kem ciphertext length")
 	}
 
-	// HKDF-SHA256: ikm=shared, salt=tokenBytes, info=pairHKDFInfo
+	// HKDF-SHA256: ikm=sharedKey, salt=tokenBytes, info=pairHKDFInfo
 	aeadKey := make([]byte, chacha20poly1305.KeySize)
-	h := hkdf.New(sha256.New, shared, tokenBytes, []byte(pairHKDFInfo))
+	h := hkdf.New(sha256.New, sharedKey, tokenBytes, []byte(pairHKDFInfo))
 	if _, err := io.ReadFull(h, aeadKey); err != nil {
 		return nil, err
 	}
@@ -97,9 +103,9 @@ func BuildPairRegisterBundle(serverKeyJSON string, tokenRawURLB64 string, device
 
 	// register JSON plaintext
 	regObj := map[string]any{
-		"op":            "register",
-		"v":             1,
-		"device_id":     deviceID,
+		"op":             "register",
+		"v":              1,
+		"device_id":      deviceID,
 		"device_key_hex": deviceKeyHex,
 	}
 	plain, err := json.Marshal(regObj)
@@ -113,25 +119,26 @@ func BuildPairRegisterBundle(serverKeyJSON string, tokenRawURLB64 string, device
 		return nil, err
 	}
 
-	// aad = "PAIR" + ct + nonce
-	aad := makePairAAD(ct[:], nonce)
+	// aad = "PAIR" + kemCt + nonce
+	aad := makePairAAD(kemCt, nonce)
 
 	ciphertext := aead.Seal(nil, nonce, plain, aad)
 
 	// frame: ctLen(u16) + ct + nonce + ciphertext
-	if len(ct) > 0xFFFF {
-		return nil, errors.New("ct too large")
+	if len(kemCt) > 0xFFFF {
+		return nil, errors.New("kemCt too large")
 	}
-	frame := make([]byte, 0, 2+len(ct)+len(nonce)+len(ciphertext))
+
+	frame := make([]byte, 0, 2+len(kemCt)+len(nonce)+len(ciphertext))
 	var ctLen [2]byte
-	binary.BigEndian.PutUint16(ctLen[:], uint16(len(ct)))
+	binary.BigEndian.PutUint16(ctLen[:], uint16(len(kemCt)))
 	frame = append(frame, ctLen[:]...)
-	frame = append(frame, ct[:]...)
+	frame = append(frame, kemCt...)
 	frame = append(frame, nonce...)
 	frame = append(frame, ciphertext...)
 
 	// pack bundle: [u32 frameLen][frame][u16 ctLen][ct][32 key]
-	out := make([]byte, 0, 4+len(frame)+2+len(ct)+32)
+	out := make([]byte, 0, 4+len(frame)+2+len(kemCt)+32)
 
 	var fl [4]byte
 	binary.BigEndian.PutUint32(fl[:], uint32(len(frame)))
@@ -139,7 +146,7 @@ func BuildPairRegisterBundle(serverKeyJSON string, tokenRawURLB64 string, device
 	out = append(out, frame...)
 
 	out = append(out, ctLen[:]...)
-	out = append(out, ct[:]...)
+	out = append(out, kemCt...)
 
 	out = append(out, aeadKey...)
 	return out, nil
@@ -151,7 +158,7 @@ func DecryptPairAck(ack []byte, registerCT []byte, aeadKey []byte) (string, erro
 	if len(aeadKey) != chacha20poly1305.KeySize {
 		return "", errors.New("bad aeadKey length")
 	}
-	if len(registerCT) != mlkem768.CiphertextSize {
+	if len(registerCT) != kemCtSize768 {
 		return "", errors.New("bad registerCT length")
 	}
 	if len(ack) < chacha20poly1305.NonceSizeX+16 {
@@ -174,7 +181,7 @@ func DecryptPairAck(ack []byte, registerCT []byte, aeadKey []byte) (string, erro
 		return "", err
 	}
 
-	// Optionally sanity-check JSON includes op:"ok"
+	// Optional sanity-check JSON includes op:"ok"
 	var anyObj map[string]any
 	if err := json.Unmarshal(plain, &anyObj); err == nil {
 		if op, _ := anyObj["op"].(string); op != "" && op != "ok" {
@@ -214,3 +221,4 @@ func decodeBase64URL(s string) ([]byte, error) {
 	}
 	return d, nil
 }
+

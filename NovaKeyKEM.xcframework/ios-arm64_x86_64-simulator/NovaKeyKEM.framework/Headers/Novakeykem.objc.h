@@ -15,4 +15,23 @@ FOUNDATION_EXPORT NSData* _Nullable NovakeykemBuildApproveFrame(NSString* _Nulla
 
 FOUNDATION_EXPORT NSData* _Nullable NovakeykemBuildInjectFrame(NSString* _Nullable pairingBlobJSON, NSString* _Nullable secret, NSError* _Nullable* _Nullable error);
 
+/**
+ * BuildPairRegisterBundle returns a packed blob:
+
+[u32 frameLen][frameBytes][u16 kemCtLen][kemCt][32 aeadKey]
+
+- frameBytes is exactly what your daemon expects after server_key:
+  ctLen(u16) + ct + nonce(24) + ciphertext
+
+- kemCt is needed as AAD input for ack decrypt ("PAIR"+ct+ackNonce)
+- aeadKey is needed to decrypt ack (XChaCha20-Poly1305)
+ */
+FOUNDATION_EXPORT NSData* _Nullable NovakeykemBuildPairRegisterBundle(NSString* _Nullable serverKeyJSON, NSString* _Nullable tokenRawURLB64, NSString* _Nullable deviceID, NSString* _Nullable deviceKeyHex, NSError* _Nullable* _Nullable error);
+
+/**
+ * DecryptPairAck validates and decrypts daemon ack.
+ack is: [24-byte ackNonce][ciphertext]
+ */
+FOUNDATION_EXPORT NSString* _Nonnull NovakeykemDecryptPairAck(NSData* _Nullable ack, NSData* _Nullable registerCT, NSData* _Nullable aeadKey, NSError* _Nullable* _Nullable error);
+
 #endif

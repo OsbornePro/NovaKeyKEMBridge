@@ -15,8 +15,6 @@ import (
 	"golang.org/x/crypto/hkdf"
 )
 
-// MUST MATCH YOUR DAEMON derivePairAEADKey info string
-// You said: there is no v4; only v3.
 const pairHKDFInfo = "NovaKey v3 Pair AEAD"
 
 // ML-KEM-768 ciphertext size (Kyber768 / ML-KEM-768)

@@ -26,32 +26,66 @@ type pairingBlob struct {
 }
 
 const (
-	outerVersion  = 3
-	outerMsgType  = 1
-	innerVersion  = 1
-	innerInject   = 1
-	innerApprove  = 2
-	hkdfInfo      = "NovaKey v3 AEAD key"
+	outerVersion = 3
+	outerMsgType = 1
+
+	innerVersion = 1
+
+	innerInject  = 1
+	innerApprove = 2
+	innerArm     = 3
+	innerDisarm  = 4
+
+	hkdfInfo = "NovaKey v3 AEAD key"
 )
 
 func BuildInjectFrame(pairingBlobJSON string, secret string) ([]byte, error) {
-	return buildFrame(pairingBlobJSON, innerInject, secret)
+	return buildFrame(pairingBlobJSON, innerInject, []byte(secret))
 }
 
 func BuildApproveFrame(pairingBlobJSON string) ([]byte, error) {
-	return buildFrame(pairingBlobJSON, innerApprove, "")
+	return buildFrame(pairingBlobJSON, innerApprove, nil)
 }
 
-func buildFrame(pairingBlobJSON string, innerType byte, payload string) ([]byte, error) {
+// BuildArmFrame builds a v3 frame with inner msgType=3 and payload JSON: {"ms": <durationMs>}
+func BuildArmFrame(pairingBlobJSON string, durationMs int) ([]byte, error) {
+	if durationMs <= 0 {
+		durationMs = 15000
+	}
+	p := map[string]any{"ms": durationMs}
+	b, err := json.Marshal(p)
+	if err != nil {
+		return nil, err
+	}
+	return buildFrame(pairingBlobJSON, innerArm, b)
+}
+
+// BuildDisarmFrame builds a v3 frame with inner msgType=4 and empty payload.
+func BuildDisarmFrame(pairingBlobJSON string) ([]byte, error) {
+	return buildFrame(pairingBlobJSON, innerDisarm, nil)
+}
+
+func buildFrame(pairingBlobJSON string, innerType byte, payload []byte) ([]byte, error) {
 	var pb pairingBlob
 	if err := json.Unmarshal([]byte(pairingBlobJSON), &pb); err != nil {
 		return nil, err
 	}
+
+	// Pairing blob validation
 	if pb.DeviceID == "" || pb.DeviceKeyHex == "" || pb.ServerKyberPubB64 == "" {
 		return nil, errors.New("pairing blob missing required fields")
 	}
-	if innerType != innerInject && innerType != innerApprove {
+
+	// Allow: inject/approve/arm/disarm
+	switch innerType {
+	case innerInject, innerApprove, innerArm, innerDisarm:
+	default:
 		return nil, errors.New("invalid inner type")
+	}
+
+	// Inject requires payload (secret)
+	if innerType == innerInject && len(payload) == 0 {
+		return nil, errors.New("inject payload empty")
 	}
 
 	deviceKey, err := hex.DecodeString(pb.DeviceKeyHex)
@@ -73,7 +107,7 @@ func buildFrame(pairingBlobJSON string, innerType byte, payload string) ([]byte,
 	}
 
 	// ML-KEM encapsulate (sharedKey, ciphertext)
-	sharedKey, kemCt := ek.Encapsulate() // signature per stdlib crypto/mlkem :contentReference[oaicite:1]{index=1}
+	sharedKey, kemCt := ek.Encapsulate()
 	if len(sharedKey) != 32 {
 		return nil, errors.New("unexpected sharedKey length")
 	}
@@ -82,7 +116,7 @@ func buildFrame(pairingBlobJSON string, innerType byte, payload string) ([]byte,
 	}
 
 	// Inner typed frame
-	inner := buildInnerFrame(pb.DeviceID, innerType, []byte(payload))
+	inner := buildInnerFrame(pb.DeviceID, innerType, payload)
 
 	// Plaintext = timestamp(u64 big endian) || innerFrame
 	ts := uint64(time.Now().Unix())
@@ -176,11 +210,9 @@ func buildInnerFrame(deviceID string, msgType byte, payload []byte) []byte {
 	return out
 }
 
-// (Optional) tiny helper if we want a deterministic HMAC for “signature” style checks later.
-// Keep private unless really need it bound into Swift.
+// (Optional) helper (kept private)
 func mac256(key, data []byte) []byte {
 	m := hmac.New(sha256.New, key)
 	m.Write(data)
 	return m.Sum(nil)
 }
-

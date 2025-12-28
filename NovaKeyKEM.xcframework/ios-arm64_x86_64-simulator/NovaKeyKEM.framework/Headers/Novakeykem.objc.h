@@ -13,6 +13,16 @@
 
 FOUNDATION_EXPORT NSData* _Nullable NovakeykemBuildApproveFrame(NSString* _Nullable pairingBlobJSON, NSError* _Nullable* _Nullable error);
 
+/**
+ * BuildArmFrame builds a v3 frame with inner msgType=3 and payload JSON: {"ms": <durationMs>}
+ */
+FOUNDATION_EXPORT NSData* _Nullable NovakeykemBuildArmFrame(NSString* _Nullable pairingBlobJSON, long durationMs, NSError* _Nullable* _Nullable error);
+
+/**
+ * BuildDisarmFrame builds a v3 frame with inner msgType=4 and empty payload.
+ */
+FOUNDATION_EXPORT NSData* _Nullable NovakeykemBuildDisarmFrame(NSString* _Nullable pairingBlobJSON, NSError* _Nullable* _Nullable error);
+
 FOUNDATION_EXPORT NSData* _Nullable NovakeykemBuildInjectFrame(NSString* _Nullable pairingBlobJSON, NSString* _Nullable secret, NSError* _Nullable* _Nullable error);
 
 /**

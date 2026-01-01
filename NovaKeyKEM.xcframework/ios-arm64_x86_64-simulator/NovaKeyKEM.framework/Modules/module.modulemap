@@ -1,6 +1,6 @@
 framework module "NovaKeyKEM" {
 	header "ref.h"
-    header "Novakeykembridge.objc.h"
+    header "Novakeykem.objc.h"
     header "Universe.objc.h"
     header "NovaKeyKEM.h"
 

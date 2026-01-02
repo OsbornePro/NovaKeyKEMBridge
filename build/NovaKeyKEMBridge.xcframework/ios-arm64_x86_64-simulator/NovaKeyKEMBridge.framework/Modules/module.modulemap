@@ -1,0 +1,8 @@
+framework module "NovaKeyKEMBridge" {
+	header "ref.h"
+    header "Novakeykem.objc.h"
+    header "Universe.objc.h"
+    header "NovaKeyKEMBridge.h"
+
+    export *
+}
